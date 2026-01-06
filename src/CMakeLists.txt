@@ -101,6 +101,7 @@ if(INTEL_SUPPORT)
   target_sources(nvtop PRIVATE extract_gpuinfo_intel.c)
   target_sources(nvtop PRIVATE extract_gpuinfo_intel_i915.c)
   target_sources(nvtop PRIVATE extract_gpuinfo_intel_xe.c)
+  target_link_libraries(nvtop PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(V3D_SUPPORT)

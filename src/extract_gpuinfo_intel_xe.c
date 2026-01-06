@@ -17,6 +17,10 @@
  * You should have received a copy of the GNU General Public License
  * along with nvtop.  If not, see <http://www.gnu.org/licenses/>.
  *
+ * Intel XPU Manager integration for enhanced telemetry (global GPU utilization,
+ * PCIe throughput, memory temperature). Requires libxpum.so from:
+ * https://github.com/intel/xpumanager
+ *
  */
 
 #include "nvtop/device_discovery.h"
@@ -27,10 +31,11 @@
 #include "extract_gpuinfo_intel.h"
 
 #include <assert.h>
-#include <libdrm/drm.h>
-#include <libdrm/xe_drm.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <libdrm/drm.h>
+#include <libdrm/xe_drm.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -38,6 +43,168 @@
 #include <uthash.h>
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
+
+// XPU Manager types and function pointers
+typedef int32_t xpum_device_id_t;
+typedef int32_t xpum_result_t;
+#define XPUM_OK 0
+#define XPUM_MAX_STATS 64
+
+typedef enum {
+  XPUM_STATS_GPU_UTILIZATION = 0,
+  XPUM_STATS_POWER = 4,
+  XPUM_STATS_GPU_FREQUENCY = 6,
+  XPUM_STATS_GPU_CORE_TEMPERATURE = 7,
+  XPUM_STATS_MEMORY_USED = 8,
+  XPUM_STATS_ENGINE_GROUP_MEDIA_ALL_UTILIZATION = 16,
+  XPUM_STATS_PCIE_READ_THROUGHPUT = 32,
+  XPUM_STATS_PCIE_WRITE_THROUGHPUT = 33,
+} xpum_stats_type_t;
+
+typedef struct {
+  int32_t metricsType;
+  uint8_t isCounter;
+  uint64_t value;
+  uint64_t accumulated;
+  uint64_t min;
+  uint64_t avg;
+  uint64_t max;
+  uint32_t scale;
+} xpum_device_stats_data_t;
+
+typedef struct {
+  int32_t deviceId;
+  uint8_t isTileData;
+  int32_t tileId;
+  int32_t count;
+  xpum_device_stats_data_t dataList[XPUM_MAX_STATS];
+} xpum_device_stats_t;
+
+static void *xpum_handle = NULL;
+static bool xpum_initialized = false;
+static xpum_result_t (*xpum_init)(bool) = NULL;
+static xpum_result_t (*xpum_shutdown)(void) = NULL;
+static xpum_result_t (*xpum_get_stats)(xpum_device_id_t, xpum_device_stats_t[], uint32_t *, uint64_t *, uint64_t *,
+                                       uint64_t) = NULL;
+static xpum_result_t (*xpum_get_device_id_by_bdf)(const char *, xpum_device_id_t *) = NULL;
+
+static bool xpum_load_library(void) {
+  if (xpum_handle)
+    return true;
+
+  xpum_handle = dlopen("libxpum.so", RTLD_LAZY);
+  if (!xpum_handle)
+    return false;
+
+  xpum_init = dlsym(xpum_handle, "xpumInit");
+  xpum_shutdown = dlsym(xpum_handle, "xpumShutdown");
+  xpum_get_stats = dlsym(xpum_handle, "xpumGetStats");
+  xpum_get_device_id_by_bdf = dlsym(xpum_handle, "xpumGetDeviceIdByBDF");
+
+  if (!xpum_init || !xpum_shutdown || !xpum_get_stats || !xpum_get_device_id_by_bdf) {
+    dlclose(xpum_handle);
+    xpum_handle = NULL;
+    return false;
+  }
+
+  if (xpum_init(false) != XPUM_OK) {
+    dlclose(xpum_handle);
+    xpum_handle = NULL;
+    return false;
+  }
+
+  xpum_initialized = true;
+  return true;
+}
+
+void gpuinfo_intel_xe_xpum_shutdown(void) {
+  if (xpum_initialized && xpum_shutdown) {
+    xpum_shutdown();
+    xpum_initialized = false;
+  }
+  if (xpum_handle) {
+    dlclose(xpum_handle);
+    xpum_handle = NULL;
+  }
+}
+
+bool gpuinfo_intel_xe_get_xpum_device_id(const char *pci_bdf, int *device_id) {
+  if (!xpum_load_library() || !xpum_get_device_id_by_bdf)
+    return false;
+
+  xpum_device_id_t dev_id;
+  if (xpum_get_device_id_by_bdf(pci_bdf, &dev_id) != XPUM_OK)
+    return false;
+
+  *device_id = (int)dev_id;
+  return true;
+}
+
+static uint64_t xpum_get_stat(xpum_device_stats_t *stats, xpum_stats_type_t type) {
+  for (int i = 0; i < stats->count && i < XPUM_MAX_STATS; i++) {
+    if (stats->dataList[i].metricsType == (int32_t)type) {
+      uint64_t val = stats->dataList[i].value;
+      uint32_t scale = stats->dataList[i].scale;
+      return scale > 1 ? val / scale : val;
+    }
+  }
+  return 0;
+}
+
+static void xpum_refresh_dynamic_info(struct gpuinfo_dynamic_info *dynamic_info, int xpum_device_id) {
+  if (!xpum_handle || !xpum_get_stats || xpum_device_id < 0)
+    return;
+
+  xpum_device_stats_t stats_list[8];
+  memset(stats_list, 0, sizeof(stats_list));
+  uint32_t count = 8;
+  uint64_t begin, end;
+
+  if (xpum_get_stats(xpum_device_id, stats_list, &count, &begin, &end, 0) != XPUM_OK || count == 0)
+    return;
+
+  for (uint32_t i = 0; i < count; i++) {
+    xpum_device_stats_t *stats = &stats_list[i];
+    if (stats->isTileData)
+      continue;
+
+    uint64_t val;
+
+    val = xpum_get_stat(stats, XPUM_STATS_GPU_UTILIZATION);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, gpu_util_rate, (unsigned)val);
+
+    val = xpum_get_stat(stats, XPUM_STATS_POWER);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, power_draw, (unsigned)(val * 1000));
+
+    val = xpum_get_stat(stats, XPUM_STATS_GPU_FREQUENCY);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, gpu_clock_speed, (unsigned)val);
+
+    val = xpum_get_stat(stats, XPUM_STATS_GPU_CORE_TEMPERATURE);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, gpu_temp, (unsigned)val);
+
+    val = xpum_get_stat(stats, XPUM_STATS_MEMORY_USED);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, used_memory, val);
+
+    val = xpum_get_stat(stats, XPUM_STATS_ENGINE_GROUP_MEDIA_ALL_UTILIZATION);
+    if (val > 0) {
+      SET_GPUINFO_DYNAMIC(dynamic_info, encoder_rate, (unsigned)val);
+      SET_GPUINFO_DYNAMIC(dynamic_info, decoder_rate, (unsigned)val);
+    }
+
+    val = xpum_get_stat(stats, XPUM_STATS_PCIE_READ_THROUGHPUT);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, (unsigned)(val * 1024 / 1000));
+
+    val = xpum_get_stat(stats, XPUM_STATS_PCIE_WRITE_THROUGHPUT);
+    if (val > 0)
+      SET_GPUINFO_DYNAMIC(dynamic_info, pcie_tx, (unsigned)(val * 1024 / 1000));
+  }
+}
 
 // Copied from https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/common/intel_gem.h
 static inline int intel_ioctl(int fd, unsigned long request, void *arg) {
@@ -48,7 +215,6 @@ static inline int intel_ioctl(int fd, unsigned long request, void *arg) {
   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
   return ret;
 }
-// End Copy
 
 // Copied from https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/intel/common/xe/intel_device_query.c
 static void *xe_device_query_alloc_fetch(int fd, uint32_t query_id, uint32_t *len) {
@@ -72,11 +238,13 @@ static void *xe_device_query_alloc_fetch(int fd, uint32_t query_id, uint32_t *le
     *len = query.size;
   return data;
 }
-// End Copy
 
 void gpuinfo_intel_xe_refresh_dynamic_info(struct gpu_info *_gpu_info) {
   struct gpu_info_intel *gpu_info = container_of(_gpu_info, struct gpu_info_intel, base);
   struct gpuinfo_dynamic_info *dynamic_info = &gpu_info->base.dynamic_info;
+
+  // Supplement with XPU Manager data (global GPU util, PCIe throughput, mem temp)
+  xpum_refresh_dynamic_info(dynamic_info, gpu_info->xpum_device_id);
 
   if (gpu_info->card_fd) {
     uint32_t length = 0;
@@ -103,7 +271,6 @@ void gpuinfo_intel_xe_refresh_dynamic_info(struct gpu_info *_gpu_info) {
 }
 
 static const char xe_drm_intel_vram[] = "drm-total-vram0";
-// static const char xe_drm_intel_gtt[] = "drm-total-gtt";
 // Render
 static const char xe_drm_intel_cycles_rcs[] = "drm-cycles-rcs";
 static const char xe_drm_intel_total_cycles_rcs[] = "drm-total-cycles-rcs";
@@ -139,12 +306,10 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
   nvtop_get_current_time(&current_time);
 
   union intel_cycles gpu_cycles = {.array = {0}};
-
   union intel_cycles total_cycles = {.array = {0}};
 
   while ((count = getline(&line, &line_buf_size, fdinfo_file)) != -1) {
     char *key, *val;
-    // Get rid of the newline if present
     if (line[count - 1] == '\n') {
       line[--count] = '\0';
     }
@@ -179,7 +344,6 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
         unsigned long cycles;
         char *endptr;
 
-        // Check for cycles
         for (unsigned i = 0; i < ARRAY_SIZE(gpu_cycles.array); i++) {
           if (!strcmp(key, cycles_keys[i])) {
             cycles = strtoull(val, &endptr, 10);
@@ -187,7 +351,6 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
           }
         }
 
-        // Check for total cycles
         for (unsigned i = 0; i < ARRAY_SIZE(total_cycles_keys); i++) {
           if (!strcmp(key, total_cycles_keys[i])) {
             cycles = strtoull(val, &endptr, 10);
@@ -198,7 +361,6 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
     }
   }
 
-  // Sum cycles for overall usage
   {
     uint64_t cycles_sum = 0;
     for (unsigned i = 0; i < ARRAY_SIZE(gpu_cycles.array); i++) {
@@ -222,8 +384,6 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
   if (cache_entry) {
     HASH_DEL(gpu_info->last_update_process_cache, cache_entry);
 
-    // TODO: find how to extract global utilization
-    // gpu util will be computed as the sum of all the processes utilization for now
     {
       uint64_t cycles_delta = gpu_cycles.rcs - cache_entry->gpu_cycles.rcs;
       uint64_t total_cycles_delta = total_cycles.rcs - cache_entry->total_cycles.rcs;
@@ -255,7 +415,6 @@ bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct 
   }
 
 #ifndef NDEBUG
-  // We should only process one fdinfo entry per client id per update
   struct intel_process_info_cache *cache_entry_check;
   HASH_FIND_CLIENT(gpu_info->current_update_process_cache, &cache_entry->client_id, cache_entry_check);
   assert(!cache_entry_check && "We should not be processing a client id twice per update");

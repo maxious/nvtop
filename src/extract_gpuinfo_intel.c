@@ -67,6 +67,7 @@ static struct gpu_info_intel *gpu_infos;
 __attribute__((constructor)) static void init_extract_gpuinfo_intel(void) { register_gpu_vendor(&gpu_vendor_intel); }
 
 bool gpuinfo_intel_init(void) { return true; }
+
 void gpuinfo_intel_shutdown(void) {
   for (unsigned i = 0; i < intel_gpu_count; ++i) {
     struct gpu_info_intel *current = &gpu_infos[i];
@@ -75,6 +76,7 @@ void gpuinfo_intel_shutdown(void) {
     nvtop_device_unref(current->card_device);
     nvtop_device_unref(current->driver_device);
   }
+  gpuinfo_intel_xe_xpum_shutdown();
 }
 
 const char *gpuinfo_intel_last_error_string(void) { return "Err"; }
@@ -109,6 +111,7 @@ static void add_intel_cards(struct nvtop_device *dev, struct list_head *devices,
   thisGPU->card_device = nvtop_device_ref(dev);
   thisGPU->driver_device = nvtop_device_ref(parent);
   thisGPU->hwmon_device = nvtop_device_get_hwmon(thisGPU->driver_device);
+  thisGPU->xpum_device_id = -1;
 
   const char *devname;
   if (nvtop_device_get_devname(thisGPU->card_device, &devname) >= 0)
@@ -118,6 +121,10 @@ static void add_intel_cards(struct nvtop_device *dev, struct list_head *devices,
   int retval = nvtop_device_get_property_value(thisGPU->driver_device, "PCI_SLOT_NAME", &pdev_val);
   assert(retval >= 0 && pdev_val != NULL && "Could not retrieve device PCI slot name");
   strncpy(thisGPU->base.pdev, pdev_val, PDEV_LEN);
+
+  if (thisGPU->driver == DRIVER_XE)
+    gpuinfo_intel_xe_get_xpum_device_id(pdev_val, &thisGPU->xpum_device_id);
+
   list_add_tail(&thisGPU->base.list, devices);
   // Register a fdinfo callback for this GPU
   processinfo_register_fdinfo_callback(parse_drm_fdinfo_intel, &thisGPU->base);

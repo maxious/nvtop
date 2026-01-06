@@ -1,4 +1,10 @@
+#include <limits.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+
+#include <nvtop/extract_gpuinfo_common.h>
+#include <nvtop/time.h>
 #include <uthash.h>
 
 #define HASH_FIND_CLIENT(head, key_ptr, out_ptr) HASH_FIND(hh, head, key_ptr, sizeof(struct unique_cache_id), out_ptr)
@@ -59,9 +65,11 @@ struct gpu_info_intel {
   
   struct nvtop_device *driver_device;
   struct nvtop_device *hwmon_device;
-  struct intel_process_info_cache *last_update_process_cache, *current_update_process_cache; // Cached processes info
+  struct intel_process_info_cache *last_update_process_cache, *current_update_process_cache;
 
   struct nvtop_device *bridge_device;
+
+  int xpum_device_id;
 
   struct {
     unsigned energy_uj;
@@ -74,3 +82,6 @@ extern void gpuinfo_intel_xe_refresh_dynamic_info(struct gpu_info *_gpu_info);
 
 extern bool parse_drm_fdinfo_intel_i915(struct gpu_info *info, FILE *fdinfo_file, struct gpu_process *process_info);
 extern bool parse_drm_fdinfo_intel_xe(struct gpu_info *info, FILE *fdinfo_file, struct gpu_process *process_info);
+
+extern void gpuinfo_intel_xe_xpum_shutdown(void);
+extern bool gpuinfo_intel_xe_get_xpum_device_id(const char *pci_bdf, int *device_id);
